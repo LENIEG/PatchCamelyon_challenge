@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from torchvision.utils import save_image
 from tqdm import tqdm
 
 # Add parent directory to path for importing downloader
@@ -146,6 +147,19 @@ def run_inference(config):
     output_dir = Path(config['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    images_root = output_dir / 'classified_images'
+    outcome_dirs = {
+        'TP': images_root / 'TP',
+        'FP': images_root / 'FP',
+        'TN': images_root / 'TN',
+        'FN': images_root / 'FN',
+    }
+    for path in outcome_dirs.values():
+        path.mkdir(parents=True, exist_ok=True)
+
+    mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+
     total = 0
     correct = 0
     rows = []
@@ -175,15 +189,43 @@ def run_inference(config):
             pbar.set_postfix({'batch_acc': f'{batch_acc:.4f}', 'running_acc': f'{running_acc:.4f}'})
 
             for i in range(labels.size(0)):
+                y_true = int(labels[i].item())
+                y_pred = int(preds[i].item())
+                prob_0 = float(probs_class_0[i].item())
+                prob_1 = float(probs_class_1[i].item())
+                confidence = max(prob_0, prob_1)
+
+                if y_true == 1 and y_pred == 1:
+                    outcome = 'TP'
+                elif y_true == 0 and y_pred == 1:
+                    outcome = 'FP'
+                elif y_true == 0 and y_pred == 0:
+                    outcome = 'TN'
+                else:
+                    outcome = 'FN'
+
                 rows.append([
                     global_idx,
-                    int(labels[i].item()),
-                    int(preds[i].item()),
+                    y_true,
+                    y_pred,
                     float(logits_class_0[i].item()),
                     float(logits_class_1[i].item()),
-                    float(probs_class_0[i].item()),
-                    float(probs_class_1[i].item()),
+                    prob_0,
+                    prob_1,
                 ])
+
+                # Convert normalized tensor back to displayable RGB in [0, 1].
+                img = images[i].detach().cpu()
+                img = img * std + mean
+                img = img.clamp(0.0, 1.0)
+
+                image_name = (
+                    f'sample_{global_idx:06d}_'
+                    f'true_{y_true}_pred_{y_pred}_'
+                    f'conf_{confidence:.4f}_p1_{prob_1:.4f}.png'
+                )
+                save_image(img, outcome_dirs[outcome] / image_name)
+
                 global_idx += 1
 
     elapsed = time.perf_counter() - start_time
@@ -212,6 +254,7 @@ def run_inference(config):
         'elapsed_seconds': elapsed,
         'data_dir': config['data_dir'],
         'batch_size': config['batch_size'],
+        'classified_images_dir': str(images_root),
     }
 
     summary_path = output_dir / config['summary_file']
@@ -226,6 +269,7 @@ def run_inference(config):
     print(f"Elapsed (sec): {elapsed:.2f}")
     print(f"Saved predictions: {pred_path}")
     print(f"Saved summary: {summary_path}")
+    print(f"Saved classified images: {images_root}")
     print('=' * 60)
 
 

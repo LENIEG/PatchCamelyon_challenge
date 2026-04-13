@@ -47,6 +47,51 @@ class RandomRotate90:
 		return transforms.functional.rotate(img, angle=90 * k)
 
 
+class StainJitterHED:
+	"""Approximate stain augmentation by jittering stain concentrations in HED space."""
+
+	# Ruifrok/Jonker stain matrix approximation used for HED conversion.
+	_RGB_FROM_HED = np.array([
+		[0.650, 0.704, 0.286],
+		[0.072, 0.990, 0.105],
+		[0.268, 0.570, 0.776],
+	], dtype=np.float32)
+	_HED_FROM_RGB = np.linalg.inv(_RGB_FROM_HED).astype(np.float32)
+
+	def __init__(self, scale_jitter=0.12, bias_jitter=0.04):
+		self.scale_jitter = float(scale_jitter)
+		self.bias_jitter = float(bias_jitter)
+
+	def __call__(self, img):
+		if not isinstance(img, torch.Tensor):
+			return img
+
+		img_np = img.detach().cpu().numpy().transpose(1, 2, 0).astype(np.float32)
+		img_np = np.clip(img_np, 1e-6, 1.0)
+
+		# Convert RGB -> OD -> HED, perturb stain concentrations, then invert.
+		od = -np.log(img_np)
+		hed = np.tensordot(od, self._HED_FROM_RGB.T, axes=([2], [0]))
+
+		scale = np.random.uniform(
+			low=1.0 - self.scale_jitter,
+			high=1.0 + self.scale_jitter,
+			size=(1, 1, 3),
+		).astype(np.float32)
+		bias = np.random.uniform(
+			low=-self.bias_jitter,
+			high=self.bias_jitter,
+			size=(1, 1, 3),
+		).astype(np.float32)
+		head_aug = hed * scale + bias
+
+		od_aug = np.tensordot(head_aug, self._RGB_FROM_HED.T, axes=([2], [0]))
+		rgb_aug = np.exp(-od_aug)
+		rgb_aug = np.clip(rgb_aug, 0.0, 1.0)
+
+		return torch.from_numpy(rgb_aug.transpose(2, 0, 1)).to(dtype=img.dtype)
+
+
 def get_pathology_safe_train_transform(image_size=96, enabled=True):
 	"""
 	Concrete pathology-safe augmentation preset.
@@ -54,7 +99,9 @@ def get_pathology_safe_train_transform(image_size=96, enabled=True):
 	Includes existing downloader-style augmentations plus conservative additions:
 	- H/V flips
 	- small translation
-	- mild color jitter (stain/brightness/contrast proxy)
+	- strong brightness/contrast jitter
+	- hue/saturation jitter
+	- stain augmentation via HED-space jitter
 	- 90-degree random rotation
 	- mild random crop that retains most tissue
 	"""
@@ -73,10 +120,16 @@ def get_pathology_safe_train_transform(image_size=96, enabled=True):
 		transforms.RandomHorizontalFlip(p=0.5),
 		transforms.RandomVerticalFlip(p=0.5),
 		transforms.RandomAffine(degrees=0, translate=(4 / image_size, 4 / image_size)),
-		# Additional pathology-safe augmentations.
+		# Additional pathology-safe augmentations (high probability, training only).
 		transforms.RandomApply([
-			transforms.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.08, hue=0.02)
-		], p=0.35),
+			transforms.ColorJitter(brightness=0.35, contrast=0.35)
+		], p=0.9),
+		transforms.RandomApply([
+			transforms.ColorJitter(saturation=0.30, hue=0.08)
+		], p=0.9),
+		transforms.RandomApply([
+			StainJitterHED(scale_jitter=0.12, bias_jitter=0.04)
+		], p=0.85),
 		transforms.RandomApply([
 			RandomRotate90()
 		], p=0.5),
@@ -189,6 +242,8 @@ class ViTSmallTrainer:
 		self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 		self.best_val_acc = 0.0
 		self.best_val_loss = float('inf')
+		self.best_val_auc = float('-inf')
+		self.no_improvement_count = 0
 		self.batch_loss_history = []
 		self.batch_loss_csv_path = self.checkpoint_dir / 'batch_loss_history.csv'
 		self.metrics_csv_path = self.checkpoint_dir / 'metrics.csv'
@@ -263,8 +318,10 @@ class ViTSmallTrainer:
 					'epoch',
 					'train_loss',
 					'train_acc',
+					'train_auc',
 					'val_loss',
 					'val_acc',
+					'val_auc',
 					'backbone_lr',
 					'head_lr',
 					'epoch_time_sec',
@@ -274,8 +331,10 @@ class ViTSmallTrainer:
 						row['epoch'],
 						row['train_loss'],
 						row['train_acc'],
+						row.get('train_auc', ''),
 						row['val_loss'],
 						row['val_acc'],
+						row.get('val_auc', ''),
 						row['backbone_lr'],
 						row['head_lr'],
 						row['epoch_time_sec'],
@@ -401,21 +460,42 @@ class ViTSmallTrainer:
 		checkpoint = torch.load(ckpt_path, map_location=self.device)
 		self.model.load_state_dict(checkpoint['model_state_dict'])
 		if 'optimizer_state_dict' in checkpoint:
-			self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+			try:
+				self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+			except ValueError as ex:
+				print(f'Warning: optimizer state not loaded ({ex}). Continuing with fresh optimizer state.')
 		if 'scheduler_state_dict' in checkpoint:
-			self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+			try:
+				self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+			except ValueError as ex:
+				print(f'Warning: scheduler state not loaded ({ex}). Continuing with fresh scheduler state.')
 		self.start_epoch = int(checkpoint.get('epoch', -1)) + 1
 		self.best_val_acc = float(checkpoint.get('best_val_acc', self.best_val_acc))
 		self.best_val_loss = float(checkpoint.get('best_val_loss', self.best_val_loss))
+		self.best_val_auc = float(checkpoint.get('best_val_auc', self.best_val_auc))
+		self.no_improvement_count = int(checkpoint.get('no_improvement_count', self.no_improvement_count))
 		print(f'Resumed from checkpoint: {ckpt_path}')
 		print(f'Starting from epoch index: {self.start_epoch}')
 
-	def _is_val_loss_worsening_last_epochs(self, window=4):
-		"""Return True when validation loss strictly worsened over the last N epochs."""
-		if len(self.val_loss_history) < window:
-			return False
-		last_vals = self.val_loss_history[-window:]
-		return all(last_vals[i] > last_vals[i - 1] for i in range(1, window))
+	def _update_auc_early_stop(self, val_auc):
+		"""Update AUC-based best tracking and patience counter."""
+		if np.isnan(val_auc):
+			self.no_improvement_count += 1
+			return False, float('nan')
+
+		if np.isneginf(self.best_val_auc):
+			self.best_val_auc = val_auc
+			self.no_improvement_count = 0
+			return True, float('nan')
+
+		delta = val_auc - self.best_val_auc
+		if delta >= self.config['auc_min_delta']:
+			self.best_val_auc = val_auc
+			self.no_improvement_count = 0
+			return True, delta
+
+		self.no_improvement_count += 1
+		return False, delta
 
 	def get_dataloaders(self):
 		data_dir = Path(self.config['data_dir'])
@@ -491,7 +571,34 @@ class ViTSmallTrainer:
 		probs = torch.sigmoid(logits)
 		preds = (probs >= 0.5).float()
 		correct = (preds == labels).sum().item()
-		return loss.item(), correct, labels.size(0)
+		return (
+			loss.item(),
+			correct,
+			labels.size(0),
+			probs.detach().view(-1).cpu().numpy(),
+			labels.detach().view(-1).cpu().numpy(),
+		)
+
+	@staticmethod
+	def _compute_binary_auc(y_true, y_score):
+		"""Compute ROC-AUC from binary labels and scores without external deps."""
+		y_true = np.asarray(y_true, dtype=np.int32).reshape(-1)
+		y_score = np.asarray(y_score, dtype=np.float64).reshape(-1)
+
+		if y_true.size == 0:
+			return float('nan')
+
+		pos = np.sum(y_true == 1)
+		neg = np.sum(y_true == 0)
+		if pos == 0 or neg == 0:
+			return float('nan')
+
+		order = np.argsort(-y_score, kind='mergesort')
+		y_sorted = y_true[order]
+
+		tpr = np.concatenate(([0.0], np.cumsum(y_sorted == 1) / pos, [1.0]))
+		fpr = np.concatenate(([0.0], np.cumsum(y_sorted == 0) / neg, [1.0]))
+		return float(np.trapezoid(tpr, fpr))
 
 	def train_epoch(self, train_loader):
 		self.model.train()
@@ -499,34 +606,44 @@ class ViTSmallTrainer:
 		total_correct = 0.0
 		total_samples = 0
 		batch_losses = []
+		all_probs = []
+		all_labels = []
 
 		pbar = tqdm(train_loader, desc='Training', leave=False)
 		for images, labels in pbar:
-			loss_val, correct, n = self._step_batch(images, labels, train_mode=True)
+			loss_val, correct, n, probs_np, labels_np = self._step_batch(images, labels, train_mode=True)
 			total_loss += loss_val * n
 			total_correct += correct
 			total_samples += n
 			batch_losses.append(loss_val)
+			all_probs.append(probs_np)
+			all_labels.append(labels_np)
 			pbar.set_postfix({'loss': f'{loss_val:.4f}'})
 
-		return total_loss / total_samples, total_correct / total_samples, batch_losses
+		train_auc = self._compute_binary_auc(np.concatenate(all_labels), np.concatenate(all_probs))
+		return total_loss / total_samples, total_correct / total_samples, batch_losses, train_auc
 
 	def validate_epoch(self, valid_loader):
 		self.model.eval()
 		total_loss = 0.0
 		total_correct = 0.0
 		total_samples = 0
+		all_probs = []
+		all_labels = []
 
 		with torch.no_grad():
 			pbar = tqdm(valid_loader, desc='Validation', leave=False)
 			for images, labels in pbar:
-				loss_val, correct, n = self._step_batch(images, labels, train_mode=False)
+				loss_val, correct, n, probs_np, labels_np = self._step_batch(images, labels, train_mode=False)
 				total_loss += loss_val * n
 				total_correct += correct
 				total_samples += n
+				all_probs.append(probs_np)
+				all_labels.append(labels_np)
 				pbar.set_postfix({'loss': f'{loss_val:.4f}'})
 
-		return total_loss / total_samples, total_correct / total_samples
+		val_auc = self._compute_binary_auc(np.concatenate(all_labels), np.concatenate(all_probs))
+		return total_loss / total_samples, total_correct / total_samples, val_auc
 
 	def save_checkpoint(self, epoch, is_best=False):
 		checkpoint = {
@@ -536,6 +653,8 @@ class ViTSmallTrainer:
 			'scheduler_state_dict': self.scheduler.state_dict(),
 			'best_val_acc': self.best_val_acc,
 			'best_val_loss': self.best_val_loss,
+			'best_val_auc': self.best_val_auc,
+			'no_improvement_count': self.no_improvement_count,
 			'config': self.config,
 		}
 
@@ -557,8 +676,10 @@ class ViTSmallTrainer:
 					'epoch',
 					'train_loss',
 					'train_acc',
+					'train_auc',
 					'val_loss',
 					'val_acc',
+					'val_auc',
 					'backbone_lr',
 					'head_lr',
 					'epoch_time_sec',
@@ -568,16 +689,16 @@ class ViTSmallTrainer:
 				print(f"\nEpoch {epoch + 1}/{self.config['num_epochs']}")
 				epoch_start = time.perf_counter()
 
-				train_loss, train_acc, batch_losses = self.train_epoch(train_loader)
+				train_loss, train_acc, batch_losses, train_auc = self.train_epoch(train_loader)
 				self._save_batch_losses(epoch, batch_losses)
-				val_loss, val_acc = self.validate_epoch(valid_loader)
+				val_loss, val_acc, val_auc = self.validate_epoch(valid_loader)
 
 				backbone_lr = self.optimizer.param_groups[0]['lr'] if len(self.optimizer.param_groups) > 1 else 0.0
 				head_lr = self.optimizer.param_groups[-1]['lr']
 
 				self.scheduler.step()
 
-				is_best = val_loss < self.best_val_loss
+				is_best, auc_delta = self._update_auc_early_stop(val_auc)
 				if is_best:
 					self.best_val_loss = val_loss
 					self.best_val_acc = val_acc
@@ -589,8 +710,10 @@ class ViTSmallTrainer:
 					epoch + 1,
 					f'{train_loss:.6f}',
 					f'{train_acc:.6f}',
+					'' if np.isnan(train_auc) else f'{train_auc:.6f}',
 					f'{val_loss:.6f}',
 					f'{val_acc:.6f}',
+					'' if np.isnan(val_auc) else f'{val_auc:.6f}',
 					f'{backbone_lr:.8f}',
 					f'{head_lr:.8f}',
 					f'{elapsed:.3f}',
@@ -600,18 +723,31 @@ class ViTSmallTrainer:
 				self.val_loss_batch_positions.append(len(self.batch_loss_history))
 
 				m, s = divmod(elapsed, 60)
-				print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}')
-				print(f'Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.4f}')
+				train_auc_text = 'N/A' if np.isnan(train_auc) else f'{train_auc:.4f}'
+				val_auc_text = 'N/A' if np.isnan(val_auc) else f'{val_auc:.4f}'
+				print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train AUC: {train_auc_text}')
+				print(f'Val Loss:   {val_loss:.4f} | Val Acc:   {val_acc:.4f} | Val AUC:   {val_auc_text}')
+				if np.isnan(auc_delta):
+					print(f'Val AUC Delta: N/A | No-Improvement Counter: {self.no_improvement_count}/{self.config["auc_patience"]}')
+				else:
+					print(f'Val AUC Delta: {auc_delta:+.4f} | No-Improvement Counter: {self.no_improvement_count}/{self.config["auc_patience"]}')
 				print(f'Backbone LR: {backbone_lr:.6e} | Head LR: {head_lr:.6e}')
 				print(f'Epoch Time: {int(m):02d}:{s:05.2f}')
 
-				if self._is_val_loss_worsening_last_epochs(window=4):
-					print('Early stopping: validation loss worsened over the last 4 epochs.')
+				if self.no_improvement_count >= self.config['auc_patience']:
+					print(
+						f'Early stopping: validation AUC did not improve by at least '
+						f'{self.config["auc_min_delta"]:.4f} for {self.config["auc_patience"]} consecutive epochs.'
+					)
 					break
 
 		print('\nTraining complete')
 		print(f'Best Val Acc: {self.best_val_acc:.4f}')
 		print(f'Best Val Loss: {self.best_val_loss:.4f}')
+		if np.isneginf(self.best_val_auc):
+			print('Best Val AUC: N/A')
+		else:
+			print(f'Best Val AUC: {self.best_val_auc:.4f}')
 		print(f'Metrics saved: {metrics_path}')
 		self.plot_training_losses()
 
@@ -637,6 +773,8 @@ def get_default_config():
 		'auto_pos_weight': True,
 		'pos_weight': None,
 		'use_safe_augmentations': True,
+		'auc_min_delta': 0.003,
+		'auc_patience': 5,
 		'auto_resume': True,
 		'resume_checkpoint': '',
 	}
@@ -651,7 +789,7 @@ def main():
 		'num_workers': 0,
 		'num_epochs': 45,
 		'warmup_epochs': 5,
-		'backbone_lr': 1e-4,
+		'backbone_lr': 1e-5,
 		'head_lr': 5e-5,
 		'weight_decay': 0.05,
 		'head_dropout': 0.1,
@@ -664,6 +802,8 @@ def main():
 		'auto_pos_weight': True,
 		'pos_weight': None,
 		'use_safe_augmentations': True,
+		'auc_min_delta': 0.003,
+		'auc_patience': 5,
 		'auto_resume': True,
 		'resume_checkpoint': '',
 	}
